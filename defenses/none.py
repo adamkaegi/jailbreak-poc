@@ -7,5 +7,5 @@ class NoneDefense(BaseDefense):
     """Forwards messages directly to the model with no modification."""
 
     def query(self, messages: list[dict]) -> tuple[str, dict]:
-        response = self.client.chat(messages)
-        return response, {}
+        response, stats = self.client.chat_with_stats(messages)
+        return response, {"target_stats": stats}

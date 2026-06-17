@@ -33,13 +33,19 @@ class GuardClassifier:
 
     def classify(self, messages: list[dict], response: str) -> str:
         """Return 'safe' or 'unsafe' for the given (messages, response) pair."""
+        label, _ = self.classify_with_stats(messages, response)
+        return label
+
+    def classify_with_stats(self, messages: list[dict], response: str) -> tuple[str, dict]:
+        """Return ('safe' or 'unsafe', timing/token stats) for a guard call."""
         user_msg = next(
             (m["content"] for m in reversed(messages) if m["role"] == "user"),
             "",
         )
         prompt = _GUARD_PROMPT.format(user_message=user_msg, agent_response=response)
-        raw = self._guard.chat([{"role": "user", "content": prompt}])
-        return "unsafe" if raw.strip().lower().startswith("unsafe") else "safe"
+        raw, stats = self._guard.chat_with_stats([{"role": "user", "content": prompt}])
+        label = "unsafe" if raw.strip().lower().startswith("unsafe") else "safe"
+        return label, stats
 
 
 class LlamaGuardDefense(BaseDefense):
@@ -54,6 +60,10 @@ class LlamaGuardDefense(BaseDefense):
         self._classifier = GuardClassifier(guard_client)
 
     def query(self, messages: list[dict]) -> tuple[str, dict]:
-        response = self.client.chat(messages)
-        label = self._classifier.classify(messages, response)
-        return response, {"guard_label": label}
+        response, target_stats = self.client.chat_with_stats(messages)
+        label, guard_stats = self._classifier.classify_with_stats(messages, response)
+        return response, {
+            "guard_label": label,
+            "target_stats": target_stats,
+            "guard_stats": guard_stats,
+        }
