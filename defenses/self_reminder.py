@@ -21,5 +21,8 @@ class SelfReminderDefense(BaseDefense):
     def query(self, messages: list[dict]) -> tuple[str, dict]:
         system_msg = {"role": "system", "content": _SYSTEM_PROMPT}
         augmented = [system_msg] + list(messages)
-        response = self.client.chat(augmented)
-        return response, {"system_prompt_injected": True}
+        response, stats = self.client.chat_with_stats(augmented)
+        return response, {
+            "system_prompt_injected": True,
+            "target_stats": stats,
+        }

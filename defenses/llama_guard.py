@@ -3,6 +3,10 @@
 from model_client import ModelClient
 from defenses.base import BaseDefense
 
+BLOCKED_RESPONSE = (
+    "I can't help with that request because it may produce unsafe or harmful content."
+)
+
 # Prompt template for Llama Guard 3.  The model is trained to respond with a
 # single line "safe" or "unsafe" (optionally followed by violated category codes).
 _GUARD_PROMPT = """\
@@ -25,7 +29,7 @@ Provide your safety assessment for 'Agent' in the above conversation:
 class GuardClassifier:
     """
     Standalone Llama Guard 3 response classifier.
-    Used by both LlamaGuardDefense and the run-loop judge.
+    Used by guard-based defenses.
     """
 
     def __init__(self, guard_client: ModelClient):
@@ -33,20 +37,26 @@ class GuardClassifier:
 
     def classify(self, messages: list[dict], response: str) -> str:
         """Return 'safe' or 'unsafe' for the given (messages, response) pair."""
+        label, _ = self.classify_with_stats(messages, response)
+        return label
+
+    def classify_with_stats(self, messages: list[dict], response: str) -> tuple[str, dict]:
+        """Return ('safe' or 'unsafe', timing/token stats) for a guard call."""
         user_msg = next(
             (m["content"] for m in reversed(messages) if m["role"] == "user"),
             "",
         )
         prompt = _GUARD_PROMPT.format(user_message=user_msg, agent_response=response)
-        raw = self._guard.chat([{"role": "user", "content": prompt}])
-        return "unsafe" if raw.strip().lower().startswith("unsafe") else "safe"
+        raw, stats = self._guard.chat_with_stats([{"role": "user", "content": prompt}])
+        label = "unsafe" if raw.strip().lower().startswith("unsafe") else "safe"
+        return label, stats
 
 
 class LlamaGuardDefense(BaseDefense):
     """
     Post-hoc defense.  Queries the target model normally, then classifies the
-    response with Llama Guard 3.  The guard label is returned in metadata so
-    the run-loop judge can reuse it without a second guard call.
+    response with Llama Guard 3.  Unsafe responses are replaced before they
+    would be shown to the caller.
     """
 
     def __init__(self, client: ModelClient, guard_client: ModelClient):
@@ -54,6 +64,14 @@ class LlamaGuardDefense(BaseDefense):
         self._classifier = GuardClassifier(guard_client)
 
     def query(self, messages: list[dict]) -> tuple[str, dict]:
-        response = self.client.chat(messages)
-        label = self._classifier.classify(messages, response)
-        return response, {"guard_label": label}
+        response, target_stats = self.client.chat_with_stats(messages)
+        label, guard_stats = self._classifier.classify_with_stats(messages, response)
+        final_response = BLOCKED_RESPONSE if label == "unsafe" else response
+        return final_response, {
+            "guard_label": label,
+            "blocked_by_guard": label == "unsafe",
+            "original_response": response,
+            "response_replaced": label == "unsafe",
+            "target_stats": target_stats,
+            "guard_stats": guard_stats,
+        }

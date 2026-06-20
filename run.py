@@ -14,10 +14,12 @@ It is excluded from version control via .gitignore — do not commit it.
 import argparse
 import csv
 import json
+import re
 import sys
 from collections import namedtuple
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 
 import ollama
 from rich.console import Console
@@ -28,8 +30,7 @@ import config
 from model_client import ModelClient
 from attacks import get_attack
 from defenses import get_defense
-from defenses.llama_guard import GuardClassifier
-from judge import is_attack_success_refusal, is_attack_success_guard
+from judge import is_attack_success_refusal
 
 console = Console()
 
@@ -97,17 +98,28 @@ def load_behaviors(n: int) -> list:
 def evaluate_condition(
     messages: list[dict],
     defense,
-    classifier: GuardClassifier,
     verbose: bool = False,
 ) -> dict:
-    """Run one (messages, defense) pair and return judge results."""
+    """Run one (messages, defense) pair and return refusal/latency metrics."""
     if verbose:
         _print_messages(messages)
 
+    start = perf_counter()
     response, meta = defense.query(messages)
+    defense_elapsed_s = perf_counter() - start
 
-    # Reuse guard label from defense metadata to avoid a redundant call.
-    guard_label = meta.get("guard_label") or classifier.classify(messages, response)
+    guard_label = meta.get("guard_label", "")
+    guard_stats = meta.get("guard_stats", {})
+
+    target_stats = meta.get("target_stats", {})
+    target_latency_s = target_stats.get("latency_s", 0)
+    guard_latency_s = guard_stats.get("latency_s", 0)
+    total_latency_s = target_latency_s + guard_latency_s
+    if not total_latency_s:
+        total_latency_s = defense_elapsed_s
+
+    target_total_tokens = target_stats.get("total_tokens", 0)
+    guard_total_tokens = guard_stats.get("total_tokens", 0)
 
     if verbose:
         _print_response(response)
@@ -116,7 +128,20 @@ def evaluate_condition(
         "response": response,
         "guard_label": guard_label,
         "success_refusal": is_attack_success_refusal(response),
-        "success_guard": is_attack_success_guard(guard_label),
+        "blocked_by_guard": meta.get("blocked_by_guard", False),
+        "response_replaced": meta.get("response_replaced", False),
+        "target_latency_s": target_latency_s,
+        "guard_latency_s": guard_latency_s,
+        "total_latency_s": total_latency_s,
+        "target_prompt_tokens": target_stats.get("prompt_tokens", 0),
+        "target_completion_tokens": target_stats.get("completion_tokens", 0),
+        "target_total_tokens": target_total_tokens,
+        "target_tokens_per_second": target_stats.get("tokens_per_second", 0),
+        "guard_prompt_tokens": guard_stats.get("prompt_tokens", 0),
+        "guard_completion_tokens": guard_stats.get("completion_tokens", 0),
+        "guard_total_tokens": guard_total_tokens,
+        "guard_tokens_per_second": guard_stats.get("tokens_per_second", 0),
+        "total_tokens": target_total_tokens + guard_total_tokens,
     }
 
 
@@ -143,17 +168,21 @@ def run(
     guard_model: str,
     base_url: str,
     verbose: bool = False,
+    skip_startup_check: bool = False,
+    run_id: str | None = None,
 ) -> list[dict]:
     """Full evaluation: returns one record per behavior."""
-    required = [target_model, guard_model]
-    check_ollama(base_url, required)
+    uses_guard_defense = defense_name in {"llama_guard", "both"}
+    if not skip_startup_check:
+        required = [target_model]
+        if uses_guard_defense:
+            required.append(guard_model)
+        check_ollama(base_url, required)
 
     target_client = ModelClient(target_model, base_url)
-    guard_client = ModelClient(guard_model, base_url)
-    classifier = GuardClassifier(guard_client)
+    guard_client = ModelClient(guard_model, base_url) if uses_guard_defense else None
 
     attack = get_attack(attack_name)
-    no_defense = get_defense("none", target_client)
     with_defense = get_defense(defense_name, target_client, guard_client)
 
     behaviors = load_behaviors(n)
@@ -167,6 +196,16 @@ def run(
     )
 
     records = []
+    checkpoint_meta = {
+        "attack": attack_name,
+        "defense": defense_name,
+        "n_behaviors": n,
+        "target_models": [target_model],
+        "guard_model": guard_model,
+        "timestamp": datetime.now().isoformat(),
+        "status": "partial",
+        "completed_behaviors": 0,
+    }
     for idx, b in enumerate(behaviors):
         behavior_text = b.behavior
         behavior_id = getattr(b, "behavior_id", str(idx + 1))
@@ -181,49 +220,102 @@ def run(
         # Condition A: attack, no defense
         if verbose:
             console.print("\n[bold yellow]── Condition A (no defense) ──[/bold yellow]")
-        cond_a = evaluate_condition(messages, no_defense, classifier, verbose=verbose)
+        cond = evaluate_condition(messages, with_defense, verbose=verbose)
 
         # Condition B: attack + chosen defense
         if verbose:
             console.print(f"\n[bold yellow]── Condition B ({defense_name}) ──[/bold yellow]")
-        cond_b = evaluate_condition(messages, with_defense, classifier, verbose=verbose)
-
-        _log_condition("A (no defense)", cond_a)
-        _log_condition(f"B ({defense_name})", cond_b)
+        _log_condition(defense_name, cond)
 
         records.append({
+            "target_model": target_model,
+            "attack": attack_name,
+            "defense": defense_name,
             "behavior_id": behavior_id,
             "behavior": behavior_text,
             "prompt_sent": messages[0]["content"],
-            # Condition A
-            "a_guard_label": cond_a["guard_label"],
-            "a_success_refusal": cond_a["success_refusal"],
-            "a_success_guard": cond_a["success_guard"],
-            "a_response": cond_a["response"],
-            # Condition B
-            "b_guard_label": cond_b["guard_label"],
-            "b_success_refusal": cond_b["success_refusal"],
-            "b_success_guard": cond_b["success_guard"],
-            "b_response": cond_b["response"],
+            "guard_label": cond["guard_label"],
+            "success_refusal": cond["success_refusal"],
+            "blocked_by_guard": cond["blocked_by_guard"],
+            "response_replaced": cond["response_replaced"],
+            "target_latency_s": cond["target_latency_s"],
+            "guard_latency_s": cond["guard_latency_s"],
+            "total_latency_s": cond["total_latency_s"],
+            "target_prompt_tokens": cond["target_prompt_tokens"],
+            "target_completion_tokens": cond["target_completion_tokens"],
+            "target_total_tokens": cond["target_total_tokens"],
+            "target_tokens_per_second": cond["target_tokens_per_second"],
+            "guard_prompt_tokens": cond["guard_prompt_tokens"],
+            "guard_completion_tokens": cond["guard_completion_tokens"],
+            "guard_total_tokens": cond["guard_total_tokens"],
+            "guard_tokens_per_second": cond["guard_tokens_per_second"],
+            "total_tokens": cond["total_tokens"],
+            "response": cond["response"],
         })
+        checkpoint_meta["completed_behaviors"] = len(records)
+        save_checkpoint(records, checkpoint_meta, run_id)
 
     return records
 
 
+def run_suite(
+    attack_name: str,
+    defense_name: str,
+    n: int,
+    target_models: list[str],
+    guard_model: str,
+    base_url: str,
+    verbose: bool = False,
+    run_id: str | None = None,
+) -> list[dict]:
+    """Evaluate the same attack/defense across multiple target models."""
+    required = [*target_models]
+    if defense_name in {"llama_guard", "both"}:
+        required.append(guard_model)
+    check_ollama(base_url, required)
+
+    all_records = []
+    for idx, target_model in enumerate(target_models):
+        if idx:
+            console.rule(style="dim")
+
+        records = run(
+            attack_name=attack_name,
+            defense_name=defense_name,
+            n=n,
+            target_model=target_model,
+            guard_model=guard_model,
+            base_url=base_url,
+            verbose=verbose,
+            skip_startup_check=True,
+            run_id=run_id,
+        )
+        print_summary_table(records, defense_name, title_suffix=f" — {target_model}")
+        all_records.extend(records)
+
+    print_model_comparison_table(all_records, defense_name)
+    return all_records
+
+
 def _log_condition(label: str, cond: dict) -> None:
     refused = not cond["success_refusal"]
-    guard = cond["guard_label"]
     refused_str = "[green]YES[/green]" if refused else "[red]NO[/red]"
-    guard_str = "[red]UNSAFE[/red]" if guard == "unsafe" else "[green]SAFE[/green]"
-    console.print(f"    {label:<20} refused={refused_str}  guard={guard_str}")
+    extra = ""
+    if cond["guard_label"]:
+        blocked_str = "[green]YES[/green]" if cond["blocked_by_guard"] else "[yellow]NO[/yellow]"
+        extra = f"  guard_blocked={blocked_str}"
+    console.print(
+        f"    {label:<20} refused={refused_str}  "
+        f"latency={cond['total_latency_s']:.2f}s  tokens={cond['total_tokens']}{extra}"
+    )
 
 
 # ── Output ────────────────────────────────────────────────────────────────────
 
-def print_summary_table(records: list[dict], defense_name: str) -> None:
+def print_summary_table(records: list[dict], defense_name: str, title_suffix: str = "") -> None:
     """Print a Rich before/after summary table."""
     table = Table(
-        title="Jailbreak Attack vs. Defense — Summary",
+        title=f"Jailbreak Attack vs. Defense — Summary{title_suffix}",
         box=box.ROUNDED,
         show_footer=True,
     )
@@ -235,24 +327,21 @@ def print_summary_table(records: list[dict], defense_name: str) -> None:
         rate = sum(values) / n if n else 0
         return f"{rate:.0%} ASR"
 
-    a_ref = [r["a_success_refusal"] for r in records]
-    a_grd = [r["a_success_guard"] for r in records]
-    b_ref = [r["b_success_refusal"] for r in records]
-    b_grd = [r["b_success_guard"] for r in records]
+    def avg_s(values: list[float]) -> str:
+        return f"{sum(values) / n:.2f}s" if n else "0.00s"
+
+    success = [r["success_refusal"] for r in records]
+    latencies = [r["total_latency_s"] for r in records]
 
     table.add_column("Behavior ID", footer="AGGREGATE", style="bold", min_width=16)
-    table.add_column("A: No-Refusal", footer=asr(a_ref), justify="center", min_width=14)
-    table.add_column("A: Guard", footer=asr(a_grd), justify="center", min_width=14)
-    table.add_column(f"B: No-Refusal\n({defense_name})", footer=asr(b_ref), justify="center", min_width=14)
-    table.add_column(f"B: Guard\n({defense_name})", footer=asr(b_grd), justify="center", min_width=14)
+    table.add_column("No-Refusal", footer=asr(success), justify="center", min_width=14)
+    table.add_column("Latency", footer=avg_s(latencies), justify="center", min_width=12)
 
     for r in records:
         table.add_row(
             r["behavior_id"],
-            _bool_cell(r["a_success_refusal"]),
-            _guard_cell(r["a_guard_label"]),
-            _bool_cell(r["b_success_refusal"]),
-            _guard_cell(r["b_guard_label"]),
+            _bool_cell(r["success_refusal"]),
+            f"{r['total_latency_s']:.2f}s",
         )
 
     console.print()
@@ -260,7 +349,7 @@ def print_summary_table(records: list[dict], defense_name: str) -> None:
     console.print()
     console.print(
         "[dim]Columns: No-Refusal = model did not refuse (attack success by keyword check); "
-        "Guard = Llama Guard flagged response as unsafe (attack success by guard).[/dim]\n"
+        "Latency = target model time plus any active defense time.[/dim]\n"
     )
 
 
@@ -268,30 +357,208 @@ def _bool_cell(success: bool) -> str:
     return "[red]✓ success[/red]" if success else "[green]✗ blocked[/green]"
 
 
-def _guard_cell(label: str) -> str:
-    return "[red]UNSAFE[/red]" if label == "unsafe" else "[green]SAFE[/green]"
+def print_model_comparison_table(records: list[dict], defense_name: str) -> None:
+    """Print one aggregate row per target model for suite runs."""
+    grouped = {}
+    for record in records:
+        grouped.setdefault(record["target_model"], []).append(record)
+
+    table = Table(
+        title="Model Suite Comparison",
+        box=box.ROUNDED,
+    )
+    table.add_column("Target model", style="bold", min_width=20)
+    table.add_column("No-Refusal", justify="center")
+    table.add_column("Avg latency", justify="center")
+    table.add_column("Avg tokens", justify="center")
+
+    def asr(rows: list[dict], key: str) -> str:
+        return f"{sum(r[key] for r in rows) / len(rows):.0%} ASR" if rows else "n/a"
+
+    def avg(rows: list[dict], key: str) -> float:
+        return sum(r[key] for r in rows) / len(rows) if rows else 0
+
+    for model, rows in grouped.items():
+        table.add_row(
+            model,
+            asr(rows, "success_refusal"),
+            f"{avg(rows, 'total_latency_s'):.2f}s",
+            f"{avg(rows, 'total_tokens'):.0f}",
+        )
+
+    console.print()
+    console.print(table)
+    console.print()
 
 
-def save_results(records: list[dict], run_meta: dict) -> tuple[Path, Path]:
-    """Write JSON and CSV result files; return (json_path, csv_path)."""
+def save_results(records: list[dict], run_meta: dict) -> tuple[Path, Path, Path]:
+    """Write JSON, CSV, and Markdown result files."""
     out_dir = Path(config.RESULTS_DIR)
     out_dir.mkdir(exist_ok=True)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     json_path = out_dir / f"run_{ts}.json"
     csv_path = out_dir / f"run_{ts}.csv"
+    md_path = out_dir / f"run_{ts}.md"
 
     payload = {"meta": run_meta, "results": records}
-    json_path.write_text(json.dumps(payload, indent=2))
+    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     if records:
         fieldnames = list(records[0].keys())
-        with csv_path.open("w", newline="") as fh:
+        with csv_path.open("w", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(records)
 
-    return json_path, csv_path
+    md_path.write_text(build_markdown_report(records, run_meta, json_path, csv_path), encoding="utf-8")
+
+    return json_path, csv_path, md_path
+
+
+def save_checkpoint(
+    records: list[dict],
+    run_meta: dict,
+    run_id: str | None = None,
+) -> tuple[Path, Path, Path]:
+    """Overwrite a recoverable partial result after each completed behavior."""
+    out_dir = Path(config.RESULTS_DIR)
+    out_dir.mkdir(exist_ok=True)
+
+    run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_slug = _safe_slug("_".join(run_meta["target_models"]))
+    attack_slug = _safe_slug(run_meta["attack"])
+    defense_slug = _safe_slug(run_meta["defense"])
+    stem = f"checkpoint_{run_id}_{model_slug}_{attack_slug}_{defense_slug}"
+
+    json_path = out_dir / f"{stem}.json"
+    csv_path = out_dir / f"{stem}.csv"
+    md_path = out_dir / f"{stem}.md"
+
+    payload = {"meta": run_meta, "results": records}
+    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    if records:
+        fieldnames = list(records[0].keys())
+        with csv_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(records)
+
+    md_path.write_text(build_markdown_report(records, run_meta, json_path, csv_path), encoding="utf-8")
+    return json_path, csv_path, md_path
+
+
+def build_markdown_report(
+    records: list[dict],
+    run_meta: dict,
+    json_path: Path,
+    csv_path: Path,
+) -> str:
+    """Create a presentation-friendly report without embedding harmful responses."""
+    lines = [
+        "# Jailbreak Defense POC Report",
+        "",
+        "## Run",
+        "",
+        f"- Attack: `{run_meta['attack']}`",
+        f"- Defense: `{run_meta['defense']}`",
+        f"- Behaviors: `{run_meta['n_behaviors']}`",
+        f"- Target models: `{', '.join(run_meta['target_models'])}`",
+        f"- Guard model: `{run_meta['guard_model']}`" if run_meta["defense"] in {"llama_guard", "both"} else "- Guard model: `not used`",
+        f"- Timestamp: `{run_meta['timestamp']}`",
+        f"- Raw JSON: `{json_path.name}`",
+        f"- Raw CSV: `{csv_path.name}`",
+        "",
+        "## Results By Model",
+        "",
+    ]
+
+    for model, rows in _group_by_model(records).items():
+        stats = _summarize(rows)
+        lines.extend([
+            f"### {model}",
+            "",
+            "| Metric | Value |",
+            "|---|---:|",
+            f"| No-refusal ASR | {_fmt_pct(stats['refusal_asr'])} |",
+            f"| Avg total latency | {stats['latency']:.2f}s |",
+            f"| Avg target latency | {stats['target_latency']:.2f}s |",
+            f"| Avg total tokens | {stats['tokens']:.0f} |",
+            f"| Avg target tokens/sec | {stats['tps']:.0f} |",
+            "",
+            "| Behavior | No-refusal | Latency |",
+            "|---|---:|---:|",
+        ])
+
+        for row in rows:
+            lines.append(
+                "| "
+                f"{_escape_md(row['behavior_id'])} | "
+                f"{_yes_no(row['success_refusal'])} | "
+                f"{row['total_latency_s']:.2f}s |"
+            )
+        lines.append("")
+
+    overall = _summarize(records)
+    lines.extend([
+        "## Overall Statistics",
+        "",
+        "| Metric | Value |",
+        "|---|---:|",
+        f"| Total evaluated rows | {len(records)} |",
+        f"| No-refusal ASR | {_fmt_pct(overall['refusal_asr'])} |",
+        f"| Avg total latency | {overall['latency']:.2f}s |",
+        f"| Avg target latency | {overall['target_latency']:.2f}s |",
+        f"| Avg total tokens | {overall['tokens']:.0f} |",
+        f"| Avg target tokens/sec | {overall['tps']:.0f} |",
+        "",
+        "## Notes",
+        "",
+        "- No-refusal ASR means the model did not use a refusal phrase, so lower is better.",
+        "- This report intentionally omits full prompts and model responses. Use the raw JSON/CSV for audit details.",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def _group_by_model(records: list[dict]) -> dict[str, list[dict]]:
+    grouped = {}
+    for record in records:
+        grouped.setdefault(record["target_model"], []).append(record)
+    return grouped
+
+
+def _summarize(rows: list[dict]) -> dict[str, float]:
+    def rate(key: str) -> float:
+        return sum(1 for row in rows if row[key]) / len(rows) if rows else 0
+
+    def avg(key: str) -> float:
+        return sum(float(row[key]) for row in rows) / len(rows) if rows else 0
+
+    return {
+        "refusal_asr": rate("success_refusal"),
+        "latency": avg("total_latency_s"),
+        "target_latency": avg("target_latency_s"),
+        "tokens": avg("total_tokens"),
+        "tps": avg("target_tokens_per_second"),
+    }
+
+
+def _fmt_pct(value: float) -> str:
+    return f"{value:.0%}"
+
+
+def _yes_no(value: bool) -> str:
+    return "YES" if value else "NO"
+
+
+def _escape_md(value: object) -> str:
+    return str(value).replace("|", "\\|")
+
+
+def _safe_slug(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "run"
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
@@ -306,8 +573,11 @@ def parse_args() -> argparse.Namespace:
                         help=f"Defense to use (default: {config.DEFENSE})")
     parser.add_argument("--n", type=int, default=config.N_BEHAVIORS,
                         help=f"Number of behaviors (default: {config.N_BEHAVIORS})")
-    parser.add_argument("--model", default=config.TARGET_MODEL,
-                        help=f"Target model (default: {config.TARGET_MODEL})")
+    parser.add_argument("--model", default=None,
+                        help="Run one target model instead of the configured suite")
+    parser.add_argument("--models", default=",".join(config.TARGET_MODELS),
+                        help="Comma-separated target model suite "
+                             f"(default: {', '.join(config.TARGET_MODELS)})")
     parser.add_argument("--guard-model", default=config.GUARD_MODEL,
                         help=f"Guard model (default: {config.GUARD_MODEL})")
     parser.add_argument("--ollama-url", default=config.OLLAMA_BASE_URL,
@@ -317,31 +587,67 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _parse_models(raw: str) -> list[str]:
+    """Parse a comma-separated model list while preserving order."""
+    models = []
+    seen = set()
+    for item in raw.split(","):
+        model = item.strip()
+        if model and model not in seen:
+            models.append(model)
+            seen.add(model)
+    return models
+
+
 def main() -> None:
     args = parse_args()
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    records = run(
-        attack_name=args.attack,
-        defense_name=args.defense,
-        n=args.n,
-        target_model=args.model,
-        guard_model=args.guard_model,
-        base_url=args.ollama_url,
-        verbose=args.verbose,
-    )
+    target_models = [args.model] if args.model else _parse_models(args.models)
+    if not target_models:
+        console.print("[bold red]ERROR[/bold red]: At least one target model is required.")
+        sys.exit(1)
 
-    print_summary_table(records, args.defense)
+    try:
+        if len(target_models) == 1:
+            records = run(
+                attack_name=args.attack,
+                defense_name=args.defense,
+                n=args.n,
+                target_model=target_models[0],
+                guard_model=args.guard_model,
+                base_url=args.ollama_url,
+                verbose=args.verbose,
+                run_id=run_id,
+            )
+            print_summary_table(records, args.defense)
+        else:
+            records = run_suite(
+                attack_name=args.attack,
+                defense_name=args.defense,
+                n=args.n,
+                target_models=target_models,
+                guard_model=args.guard_model,
+                base_url=args.ollama_url,
+                verbose=args.verbose,
+                run_id=run_id,
+            )
+    except KeyboardInterrupt:
+        console.print(
+            "\n[yellow]Interrupted. Check results/checkpoint_* for partial JSON, CSV, and Markdown files.[/yellow]\n"
+        )
+        sys.exit(130)
 
     run_meta = {
         "attack": args.attack,
         "defense": args.defense,
         "n_behaviors": args.n,
-        "target_model": args.model,
+        "target_models": target_models,
         "guard_model": args.guard_model,
         "timestamp": datetime.now().isoformat(),
     }
-    json_path, csv_path = save_results(records, run_meta)
-    console.print(f"[dim]Results saved to:[/dim]\n  {json_path}\n  {csv_path}\n")
+    json_path, csv_path, md_path = save_results(records, run_meta)
+    console.print(f"[dim]Results saved to:[/dim]\n  {json_path}\n  {csv_path}\n  {md_path}\n")
 
 
 if __name__ == "__main__":

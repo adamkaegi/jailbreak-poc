@@ -30,19 +30,22 @@ machine after the one-time model pull.
 brew install ollama
 # or download from https://ollama.com
 ```
-# ollama serve in another terminal
+
+Start Ollama in another terminal with `ollama serve`, or use the Ollama app.
+
 ### 2. Pull the required models
 
 ```bash
-ollama pull llama3.2:3b        # target model (~2 GB, fits 8 GB M1 Air)
-ollama pull llama-guard3:1b    # guard/classifier model (~0.8 GB)
+ollama pull dolphin-mistral:7b # weaker / less-refusal target baseline
+ollama pull qwen2.5:3b         # medium small target model
+ollama pull llama3.2:3b        # stronger default-safe target model
+ollama pull llama-guard3:1b    # guard/classifier model
 ```
 
-For the 16 GB machine you can swap the target to a larger model:
+For a 16 GB machine, you can add another less-restrictive target:
 
 ```bash
-ollama pull qwen2.5:3b         # alternative 3B
-ollama pull mistral:7b         # 7B — requires ~16 GB unified memory
+ollama pull dolphin-llama3:8b
 ```
 
 ### 3. Create a virtual environment and install Python dependencies
@@ -69,14 +72,17 @@ After this step the dataset is cached locally and the tool runs fully offline.
 # Make sure Ollama is running
 ollama serve &   # or launch the Ollama app
 
-# Default run (template attack vs. llama_guard defense, N=5 behaviors)
+# Default run (template attack vs. llama_guard defense, configured model suite)
 python run.py
 
-# Override anything from the command line
+# Override the defense or sample size from the command line
 python run.py --attack template --defense self_reminder --n 10
 
-# Use a larger model (16 GB machine)
-python run.py --model mistral:7b --n 10
+# Debug one target model instead of the full suite
+python run.py --model qwen2.5:3b --n 5
+
+# Run a custom target suite
+python run.py --models dolphin-mistral:7b,qwen2.5:3b,llama3.2:3b --n 25
 
 # Baseline: raw behavior, no defense
 python run.py --attack none --defense none --n 5
@@ -88,8 +94,9 @@ python run.py --attack none --defense none --n 5
 |---|---|---|
 | `--attack` | `template` | `none` or `template` |
 | `--defense` | `llama_guard` | `none`, `self_reminder`, or `llama_guard` |
-| `--n` | `5` | Number of JBB behaviors to evaluate (max 100) |
-| `--model` | `llama3.2:3b` | Ollama target model tag |
+| `--n` | `25` | Number of JBB behaviors to evaluate (max 100) |
+| `--model` | unset | Run one Ollama target model instead of the configured suite |
+| `--models` | `dolphin-mistral:7b,qwen2.5:3b,llama3.2:3b` | Comma-separated Ollama target model suite |
 | `--guard-model` | `llama-guard3:1b` | Ollama Llama Guard model tag |
 | `--ollama-url` | `http://localhost:11434` | Ollama API base URL |
 
@@ -100,8 +107,8 @@ All defaults live in `config.py`.
 ## How it works
 
 ```
-JailbreakBench            Attack              Target model
-  behaviors   ──►  build_messages()  ──►  Ollama (llama3.2:3b)
+JailbreakBench            Attack              Target model suite
+  behaviors   ──►  build_messages()  ──►  Ollama targets
                                                 │
                      ┌──────────────────────────┘
                      │ response
@@ -121,6 +128,11 @@ Each behavior is evaluated under two conditions:
 | Input | attack template applied | same |
 | Defense | **none** (baseline) | **chosen defense** |
 | Judge | refusal keywords + Llama Guard | same |
+
+The default model suite compares defenses across targets with different baseline
+refusal behavior: a weaker/less-refusal model, a medium small model, and a
+stronger default-safe instruction model. This makes it easier to explain when
+inference-time defenses add value and when the base model already refuses.
 
 ### Attacks
 
@@ -143,8 +155,27 @@ Each behavior is evaluated under two conditions:
 |---|---|
 | **No-Refusal (attack success)** | Model response contained no refusal keywords — model likely complied |
 | **Guard: UNSAFE (attack success)** | Llama Guard flagged the response as containing unsafe content |
+| **Latency** | Wall-clock seconds for the target call plus the guard/judge call |
+| **Tokens** | Ollama-reported prompt + completion tokens, useful as a local compute-cost proxy |
 
 Higher values = attack more successful.  A good defense should reduce both.
+
+Because this project runs locally through Ollama, there is no per-call API bill.
+For cost/latency comparisons, use average total tokens and average latency:
+
+```bash
+# Quick latency/cost debug on one model
+python run.py --model qwen2.5:3b --defense llama_guard --n 5
+
+# Compare defense overhead across the default model suite
+python run.py --defense self_reminder --n 25
+python run.py --defense llama_guard --n 25
+```
+
+The CSV/JSON output includes per-condition fields such as
+`a_total_latency_s`, `b_total_latency_s`, `a_total_tokens`,
+`b_total_tokens`, `a_target_latency_s`, `b_guard_latency_s`, and
+`a_target_tokens_per_second`.
 
 ---
 
